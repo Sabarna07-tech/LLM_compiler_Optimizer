@@ -1,0 +1,12 @@
+langchain
+langgraph
+langsmith
+openai
+numexpr
+tavily-python
+python-dotenv
+pytest
+numexpr
+langchain-openai
+langchain-community
+langchain-google-genai

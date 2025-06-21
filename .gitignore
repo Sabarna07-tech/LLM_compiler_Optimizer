@@ -1,0 +1,8 @@
+# .gitignore
+.venv/
+__pycache__/
+.env
+*.pyc
+.pytest_cache/
+.vscode/
+.DS_Store
