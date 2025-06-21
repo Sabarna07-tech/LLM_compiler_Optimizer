@@ -1,4 +1,4 @@
-```markdown
+
 # LLM Compiler Optimizer
 
 ## Moto of this Project
@@ -55,4 +55,3 @@ This architecture helps to create more robust and efficient LLM agents in severa
 
 - **Extensibility:**  
   The architecture makes it easy to add new tools and capabilities to the agent. By simply defining a new tool and adding it to the list of available tools, the agent can immediately start using it in its plans.
-```
