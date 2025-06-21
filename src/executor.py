@@ -1,198 +1,156 @@
-import re
-import time
-from concurrent.futures import ThreadPoolExecutor, wait
-from typing import Any, Dict, Iterable, List, Union
-from langchain_core.runnables import chain as as_runnable, RunnableConfig # Import RunnableConfig
-from langchain_core.messages import FunctionMessage, BaseMessage
+import asyncio
+from typing import List, Dict, Any, Optional
+from uuid import uuid4
+from langchain_core.runnables import Runnable, RunnableConfig
+from langchain_core.messages import BaseMessage, ToolMessage
 from langchain_core.tools import BaseTool
-from typing_extensions import TypedDict
-from src.output_parser import Task # Relative import
+import json
 
-def _get_observations(messages: List[BaseMessage]) -> Dict[int, Any]:
-    # Get all previous tool responses
-    results = {}
-    for message in messages[::-1]:
-        if isinstance(message, FunctionMessage):
-            # Ensure idx is an integer and convert content if needed
-            idx = int(message.additional_kwargs["idx"])
-            results[idx] = message.content # Store content as is, resolution happens later
-    return results
+# This class appears to be unused based on the tracebacks,
+# but is kept as part of the file structure you provided.
+class Task:
+    """
+    A task to be executed by the agent.
+    """
+    def __init__(self, tool: BaseTool, tool_input: Dict[str, Any], id: str, depends_on: Optional[List[str]] = None):
+        self.id = id
+        self.tool = tool
+        self.input = tool_input
+        self.depends_on = depends_on or []
+        self.status = 'ready'
+        self.output = None
 
+    def invoke(self, state: Dict[str, Any], config: RunnableConfig) -> ToolMessage:
+        """Invoke the tool and return the output as a ToolMessage."""
+        try:
+            # Substitute inputs from the state
+            substituted_input = self.substitute_inputs(self.input, state)
+            output = self.tool.invoke(substituted_input, config)
+            self.status = 'done'
+            self.output = output
+            # Pass the tool's name in the ToolMessage
+            return ToolMessage(content=str(output), name=self.tool.name, tool_call_id=self.id)
+        except Exception as e:
+            self.status = 'error'
+            self.output = str(e)
+            return ToolMessage(content=f"Error: {e}", name=self.tool.name, tool_call_id=self.id)
 
-class SchedulerInput(TypedDict):
-    messages: List[BaseMessage]
-    tasks: Iterable[Task]
+    def substitute_inputs(self, tool_input: Any, state: Dict[str, Any]) -> Any:
+        """Recursively substitute task outputs in the input."""
+        if isinstance(tool_input, str) and tool_input.startswith('$'):
+            task_id = tool_input[1:]
+            if task_id in state:
+                return state[task_id]
+        elif isinstance(tool_input, dict):
+            return {k: self.substitute_inputs(v, state) for k, v in tool_input.items()}
+        elif isinstance(tool_input, list):
+            return [self.substitute_inputs(i, state) for i in tool_input]
+        return tool_input
 
-
-def _execute_task(task: Task, observations: Dict[int, Any], config: RunnableConfig) -> Any:
-    tool_to_use = task["tool"]
-    
-    # If the tool is a string (e.g., 'join'), just return it.
-    if isinstance(tool_to_use, str):
-        return tool_to_use
-
-    args = task["args"]
-    resolved_args = {}
+# MODIFIED FUNCTION
+async def _execute_task(task: Dict, state: Dict, config: Dict) -> Optional[ToolMessage]:
+    """
+    Executes a single task and returns a ToolMessage or None for join tasks.
+    """
+    if task['tool'] == 'join':
+        return None
 
     try:
-        if isinstance(args, dict):
-            for key, val in args.items():
-                resolved_args[key] = _resolve_arg(val, observations)
+        # Execute the tool with its arguments
+        result = await asyncio.to_thread(task['tool'].invoke, task['args'])
+
+        # --- START OF NEW LOGIC ---
+        # If the result is a list of dicts (like from Tavily), extract the content.
+        if isinstance(result, list) and all(isinstance(i, dict) for i in result):
+            # This specifically targets search results to make them readable for the joiner
+            content = "\n".join([item.get("content", "") for item in result])
+        elif isinstance(result, list):
+            # Fallback for other kinds of lists
+            content = json.dumps(result)
         else:
-            resolved_args = _resolve_arg(args, observations)
-            
-    except Exception as e:
-        return (
-            f"ERROR(Failed to resolve arguments for {tool_to_use.name} with args {args}. "
-            f"Error: {repr(e)})"
-        )
+            # For any other data type
+            content = str(result)
+        # --- END OF NEW LOGIC ---
         
-    try:
-        # Invoke the tool with resolved arguments and config
-        return tool_to_use.invoke(resolved_args, config)
-    except Exception as e:
-        import traceback
-        return (
-            f"ERROR(Failed to call {tool_to_use.name} with args {args}. "
-            + f" Args resolved to {resolved_args}. Error: {repr(e)}\n{traceback.format_exc()})"
+        # Return a ToolMessage for LangGraph
+        return ToolMessage(
+            content=content, 
+            name=task['tool'].name, 
+            # Use a more robust ID format and embed the original arguments
+            tool_call_id=f"call_{task['idx']}",
+            additional_kwargs={"args": task['args']}
         )
 
+    except Exception as e:
+        # In case of an error during tool execution
+        return ToolMessage(
+            content=f"Error: {e}", 
+            name=getattr(task.get('tool'), 'name', 'unknown_tool'), 
+            tool_call_id=f"call_{task['idx']}"
+        )
 
-def _resolve_arg(arg: Any, observations: Dict[int, Any]) -> Any:
-    """Recursively resolve argument values, substituting ${ID} with observed results."""
-    ID_PATTERN = r"\$\{(\d+)\}"
-
-    if isinstance(arg, str):
-        # If the string contains a single ${ID} and nothing else, return the direct observation
-        match = re.fullmatch(ID_PATTERN, arg)
-        if match:
-            idx = int(match.group(1))
-            return observations.get(idx, arg) # Return original arg if not found in observations
+# MODIFIED FUNCTION
+async def _schedule_tasks_async(tasks: List[Dict], config: RunnableConfig) -> List[BaseMessage]:
+    """
+    Main coroutine to schedule and execute tasks concurrently.
+    """
+    print("Inspecting tasks:", tasks)
+    task_map = {task['idx']: task for task in tasks}
+    task_outputs: Dict[str, Any] = {}
+    pending_tasks = list(tasks)
+    messages = []
+    
+    while pending_tasks:
+        ready_tasks = [
+            task for task in pending_tasks
+            if all(dep in task_outputs for dep in task['dependencies'])
+        ]
         
-        # Otherwise, substitute all ${ID} occurrences
-        def replace_match(match_obj):
-            idx = int(match_obj.group(1))
-            return str(observations.get(idx, match_obj.group(0))) # Replace with original placeholder if not found
+        if not ready_tasks:
+            # Handle deadlock or finished execution
+            break
+
+        # Execute ready tasks concurrently
+        results = await asyncio.gather(
+            *[_execute_task(task, task_outputs, config) for task in ready_tasks]
+        )
         
-        return re.sub(ID_PATTERN, replace_match, arg)
-
-    elif isinstance(arg, list):
-        return [_resolve_arg(item, observations) for item in arg]
-    
-    elif isinstance(arg, dict):
-        return {k: _resolve_arg(v, observations) for k, v in arg.items()}
-    
-    else:
-        return arg
-
-
-@as_runnable
-def schedule_task(task_inputs: Dict[str, Any], config: RunnableConfig) -> None:
-    """Execute a single task and store its observation."""
-    task: Task = task_inputs["task"]
-    observations: Dict[int, Any] = task_inputs["observations"]
-    
-    # Execute the task
-    observation = _execute_task(task, observations, config)
-    
-    # Store the observation. This is thread-safe as dictionary assignment is atomic.
-    observations[task["idx"]] = observation
-
-
-def schedule_pending_task(
-    task: Task, observations: Dict[int, Any], config: RunnableConfig, retry_after: float = 0.2
-):
-    """Schedule a task that has dependencies, waiting for them to be met."""
-    while True:
-        deps = task["dependencies"]
-        # Check if all dependencies are satisfied
-        if deps and (any(dep not in observations for dep in deps)):
-            time.sleep(retry_after)
-            continue
-        
-        # Dependencies met, execute the task
-        schedule_task.invoke({"task": task, "observations": observations}, config)
-        break
-
-
-@as_runnable
-def schedule_tasks(scheduler_input: SchedulerInput, config: RunnableConfig) -> List[FunctionMessage]:
-    """Group the tasks into a DAG schedule and execute them concurrently."""
-    tasks = list(scheduler_input["tasks"]) # Convert iterable to list for multiple passes
-    
-    # Get initial observations from previous messages in the state
-    messages = scheduler_input["messages"]
-    observations = _get_observations(messages)
-    
-    # Store original keys to identify new observations
-    original_observation_keys = set(observations.keys())
-
-    futures = []
-    
-    with ThreadPoolExecutor() as executor:
-        for task in tasks:
-            deps = task["dependencies"]
-            
-            # Check if task is a 'join' tool. If so, it will be handled by the joiner node.
-            if isinstance(task["tool"], str) and task["tool"] == "join":
-                # Ensure join task has all preceding tasks as dependencies
-                task['dependencies'] = list(range(1, task['idx']))
-                # No need to execute 'join' here; its results are just
-                # the collection of previous observations.
-                # So, we simply schedule it to wait for its dependencies
-                futures.append(
-                    executor.submit(
-                        schedule_pending_task, task, observations, config 
-                    )
-                )
-                continue
-
-            if (deps and any(dep not in observations for dep in deps)):
-                # Task has dependencies not yet satisfied, submit to wait pool
-                futures.append(
-                    executor.submit(
-                        schedule_pending_task, task, observations, config
-                    )
-                )
+        # Process results
+        for task, tool_message in zip(ready_tasks, results):
+            # Store output for other tasks to use. Join tasks will have None.
+            if tool_message:
+                task_outputs[task['idx']] = tool_message.content
             else:
-                # No dependencies or all dependencies satisfied, execute immediately
-                futures.append(
-                    executor.submit(
-                        schedule_task.invoke, dict(task=task, observations=observations), config
-                    )
-                )
+                task_outputs[task['idx']] = None
 
-        # Wait for all submitted tasks (including those waiting for dependencies) to complete
-        wait(futures)
+            # Only append actual ToolMessages to the final list for LangGraph
+            if tool_message is not None:
+                messages.append(tool_message)
+
+        # Remove completed tasks from the pending list
+        pending_tasks = [task for task in pending_tasks if task not in ready_tasks]
         
-    # Prepare messages for the next state
-    tool_messages = []
-    # Sort observations by index for consistent message ordering
-    sorted_new_observation_keys = sorted(observations.keys() - original_observation_keys)
-
-    for k in sorted_new_observation_keys:
-        # Find the task associated with this observation key
-        found_task = next((t for t in tasks if t['idx'] == k), None)
-
-        if found_task and found_task['tool'] != 'join': # Do not create FunctionMessage for 'join' itself
-            name = found_task['tool'].name if isinstance(found_task['tool'], BaseTool) else str(found_task['tool'])
-            task_args = found_task['args']
-            obs_content = observations[k]
-
-            tool_messages.append(
-                FunctionMessage(
-                    name=name,
-                    content=str(obs_content),
-                    additional_kwargs={"idx": k, "args": task_args},
-                    tool_call_id=str(k), # tool_call_id should be string
-                )
-            )
-        elif found_task and found_task['tool'] == 'join':
-            # For 'join' task, we need to collect all previous observations
-            # and pass them to the joiner. This is done implicitly when
-            # the joiner node is invoked, as it gets the full 'messages' state.
-            # We don't need a FunctionMessage for the join task itself here.
-            pass
+    return messages
 
 
-    return tool_messages
+def schedule_tasks(scheduler_input: Dict[str, Any], config: RunnableConfig) -> List[BaseMessage]:
+    """
+    Synchronous wrapper for the async task scheduler.
+    """
+    # The input from the planner is a generator, so convert it to a list to allow iteration
+    tasks = list(scheduler_input["tasks"]) 
+    return asyncio.run(_schedule_tasks_async(tasks, config))
+
+# This runnable class wraps the scheduling logic for LangGraph
+class TaskScheduler(Runnable):
+    def invoke(self, input: Dict[str, Any], config: Optional[RunnableConfig] = None) -> List[BaseMessage]:
+        return schedule_tasks(input, config or {})
+
+    async def ainvoke(self, input: Dict[str, Any], config: Optional[RunnableConfig] = None) -> List[BaseMessage]:
+        # The input from the planner is a generator, so convert it to a list
+        tasks = list(input["tasks"])
+        return await _schedule_tasks_async(tasks, config or {})
+
+
+# Instantiate the scheduler for use in your graph
+task_scheduler = TaskScheduler()
