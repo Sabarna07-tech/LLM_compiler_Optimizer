@@ -13,6 +13,8 @@ from langchain_community.tools.tavily_search import TavilySearchResults
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
+from src.gmeet_tool import gmeet_tool # Import the new gmeet_tool
+
 load_dotenv()
 
 # --- Tavily Search Tool ---
@@ -126,4 +128,4 @@ def get_math_tool(llm: ChatGoogleGenerativeAI) -> StructuredTool:
 
 llm_for_tools = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0)
 math_tool = get_math_tool(llm_for_tools)
-tools: List[BaseTool] = [search, math_tool]
+tools: List[BaseTool] = [search, math_tool, gmeet_tool]

@@ -10,3 +10,10 @@ numexpr
 langchain-openai
 langchain-community
 langchain-google-genai
+selenium
+webdriver-manager
+schedule
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+selenium-stealth

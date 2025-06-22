@@ -1,6 +1,8 @@
 import os
+import argparse
 from langchain_core.messages import HumanMessage
-from src.agent import invoke_agent # Our agent chain wrapper
+from src.agent import invoke_agent
+from src.scheduler import schedule_gmeet
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -12,19 +14,28 @@ def main():
     os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY")
     os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGCHAIN_PROJECT", "LLMCompiler-Project")
 
-    print("LLMCompiler Agent Ready!")
-    print("Type 'exit' to quit.")
+    parser = argparse.ArgumentParser(description="LLMCompiler Agent")
+    parser.add_argument("--meet_url", type=str, help="The URL of the Google Meet to join.")
+    parser.add_argument("--join_time", type=str, help="The time to join the meet in HH:MM format.")
+    args = parser.parse_args()
 
-    while True:
-        user_input = input("You: ")
-        if user_input.lower() == 'exit':
-            break
+    # Logic for scheduling a meeting with hardcoded cookies
+    if args.meet_url and args.join_time:
+        schedule_gmeet(meet_url=args.meet_url, join_time=args.join_time)
+    else:
+        # Fallback to the interactive agent mode
+        print("LLMCompiler Agent Ready!")
+        print("Type 'exit' to quit.")
 
-        print(f"Agent is thinking about: '{user_input}'...")
-        
-        # Invoke the agent
-        response = invoke_agent(user_input)
-        print(f"Agent: {response}")
+        while True:
+            user_input = input("You: ")
+            if user_input.lower() == 'exit':
+                break
+
+            print(f"Agent is thinking about: '{user_input}'...")
+            
+            response = invoke_agent(user_input)
+            print(f"Agent: {response}")
 
 if __name__ == "__main__":
     main()
